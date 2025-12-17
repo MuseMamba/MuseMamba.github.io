@@ -2,7 +2,7 @@
 title: RenZezhong's Blog
 email: renzezhong@outlook.com
 description: > # this means to ignore newlines until "baseurl:"
-  RenZezhong's Blog
+  "Ren Zezhong | Researcher| Engineer"
 baseurl: "" # the subpath of your site, e.g. /blog/
 url: https://MuseMamba.github.io # the base hostname & protocol for your site
 rss_url: /pages/feed.xml
