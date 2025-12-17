@@ -1,10 +1,3 @@
----
-title: Why Blog
-layout: post
----
-
-## 关于我
-
 # Ren Zezhong
 任泽众， 我是一名在读博士生，目前是第四年，主要从事操作系统模糊测试以及AI Infra。
 
