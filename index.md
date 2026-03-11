@@ -1,11 +1,21 @@
-# Ren Zezhong
-任泽众， 我是一名在读博士生，目前是第四年，主要从事操作系统模糊测试以及AI Infra。
+# Ren Zezhong (UCAS; EPFL)
+任泽众， 我是一名在读博士生，目前是第四年(2022-0.0)，主要从事操作系统模糊测试以及AI Infra。
 
 ## 博客的目的
 
 首要目的是记录自己在领域内的成长过程，给自己在L3存储long context的记忆避免模型遗忘关键KEY（:>!
 
 希望千年后，这些记录可以成为考古学家了解当代牛马博士的重要窗口， PHD=Prolonged Hard Days → (but) Progress Happens Daily.
+
+## Publications
+- Sysyphuzz: the Pressure of More Coverage (https://github.com/HexHive/Sysyphuzz) 
+NDSS26 First Author
+
+- FishFuzz (https://github.com/HexHive/FishFuzz) 
+Usenix23 Fourth Author
+
+- A Review of Fuzzing Techniques  (https://crad.ict.ac.cn/article/doi/10.7544/issn1000-1239.2021.20201018) 
+Journal of Computer Research and Development 2021 First Author
 
 ## 博客平台
 
