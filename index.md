@@ -23,6 +23,9 @@ Journal of Computer Research and Development 2021 First Author
 
 ## 博客的目的
 
+原来构建过个人网站，但是个人太菜，用不惯：(https://wordpress.com/posts/renzezhong.wordpress.com)
+迁移至此，内容才最重要，不在纠结排版。
+
 首要目的是记录自己在领域内的成长过程，给自己在L3存储long context的记忆避免模型遗忘关键KEY（:>!
 
 希望千年后，这些记录可以成为考古学家了解当代牛马博士的重要窗口， PHD=Prolonged Hard Days → (but) Progress Happens Daily.
