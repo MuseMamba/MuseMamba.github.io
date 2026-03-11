@@ -4,6 +4,7 @@ title: Vim 常用资源
 category: 资源
 tags: Vim
 keywords: Vim
+description: Vim 常用资源
 ---
 
 ## 在粘贴代码时不启动自动缩进
