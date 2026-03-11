@@ -1,21 +1,20 @@
 # Ren Zezhong (UCAS; EPFL)
 任泽众， 我是一名在读博士生，目前是第四年(2022-0.0)，主要从事操作系统模糊测试以及AI Infra。
 
-* 目前在寻找相关实习，特别是27届可转正实习。
-- renzezhong@outlook.com
+* 目前在寻找相关实习，特别是27届可转正实习 (renzezhong@outlook.com)
 
 ## Publications
-- Sysyphuzz: the Pressure of More Coverage (https://github.com/HexHive/Sysyphuzz) 
+Sysyphuzz: the Pressure of More Coverage (https://github.com/HexHive/Sysyphuzz) 
 
-NDSS26 First Author
+- NDSS26 (Top4) First Author
 
-- FishFuzz (https://github.com/HexHive/FishFuzz) 
+FishFuzz (https://github.com/HexHive/FishFuzz) 
 
-Usenix23 Fourth Author
+- Usenix23 (Top4) Fourth Author
 
-- A Review of Fuzzing Techniques  (https://crad.ict.ac.cn/article/doi/10.7544/issn1000-1239.2021.20201018) 
+A Review of Fuzzing Techniques  (https://crad.ict.ac.cn/article/doi/10.7544/issn1000-1239.2021.20201018) 
 
-Journal of Computer Research and Development 2021 First Author
+- Journal of Computer Research and Development 2021(CCF-A) First Author
 
 ## Research Area
 - AI Infra
