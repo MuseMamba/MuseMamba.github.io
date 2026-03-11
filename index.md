@@ -1,6 +1,7 @@
 # Ren Zezhong (UCAS; EPFL)
 任泽众， 我是一名在读博士生，目前是第四年(2022-0.0)，主要从事操作系统模糊测试以及AI Infra。
-目前在寻找相关实习，特别是27届可转正实习。
+
+* 目前在寻找相关实习，特别是27届可转正实习。
 - renzezhong@outlook.com
 
 ## Publications
