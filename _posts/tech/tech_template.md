@@ -4,6 +4,7 @@ title: Java 里 NonNull 和 NotNull 区别
 category: 技术
 tags: [java]
 keywords: java,nonnull,notnull
+description: Java 里 NonNull 和 NotNull 区别
 ---
 
 日常码 Java 的时候经常会遇到几个常用的 annotations，经常要用到 @NonNull，@NotNull 以及 @Nonnull。每次用都要查，每次查完又会忘掉，这里特意来总结一下以后用来自查。英文比较全的解释可以参考 [stackoverflow](https://stackoverflow.com/questions/4963300/which-notnull-java-annotation-should-i-use) 。
