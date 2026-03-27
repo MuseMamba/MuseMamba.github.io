@@ -24,6 +24,8 @@ It applies a **random rotation** to the original vector (QR-based in the paper; 
 - As the dimension **d** increases, the coordinate distribution concentrates toward **N(0, 1/d)**, and coordinates become approximately independent (in a probabilistic sense).
 - With near-independent coordinates, TurboQuant enables **per-coordinate scalar quantization** (e.g., **Lloyd–Max**) to compute near-optimal centroids.
 - **QJL** is introduced to mitigate inner-product errors beyond MSE (note: the current PR has not fully integrated this part yet).
+- TurboQuant performs better when the model’s **K-norm** is close to **1**, because it assumes the input vectors lie on (or near) the **unit hypersphere**, i.e., \( \|x\|_2^2 = 1 \).  
+  This helps explain why **Mistral-7B** (≈ **1.3×**) performs better than **Qwen3** (≈ **2.1×–2.4×**) under TurboQuant.
 
 > Note: This is my personal interpretation and summary. I recommend reading the original paper and the PR side by side.  
 > In my view, AI infrastructure is one of the most tightly coupled areas between academia and industry: mathematical elegance is like an artist’s ideas, while AI infra is the craft—brushes, canvas, and technique. Its impact will likely keep expanding, much like the ripple effects of the Industrial Revolution.
