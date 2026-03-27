@@ -1,6 +1,7 @@
 ---
 layout: post
 title: "TurboQuant: Near-Optimal Online Vector Quantization"
+tags: [Quantization]
 category: 阅读
 keywords: [阅读, Google, TurboQuant]
 description: "本文介绍 Google 提出的 TurboQuant：一种近似最优的在线向量量化算法，用于在推理阶段压缩 KV cache，适配大规模模型部署。"
