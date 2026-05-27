@@ -441,3 +441,145 @@ Host Kernel
 ```
 
 This composability is what makes namespaces powerful — you can share a network namespace between containers (pod networking in Kubernetes) while keeping everything else isolated.
+
+## Case Study: How Claude Code Uses Namespaces
+
+[Claude Code](https://code.claude.com), Anthropic's AI coding agent CLI, provides a concrete real-world example of using Linux namespaces for lightweight sandboxing — not to run full containers, but to **restrict what shell commands can access** at the OS level.
+
+### The Problem
+
+Claude Code executes arbitrary Bash commands on behalf of the user (builds, tests, scripts). Without isolation, a misbehaving or compromised command could:
+- Write to sensitive files outside the project (e.g., `~/.ssh/`, `~/.bashrc`)
+- Exfiltrate data over the network to unauthorized hosts
+- Modify its own sandbox policy by editing settings files
+
+### The Solution: Bubblewrap + User Namespaces
+
+On Linux (and WSL2), Claude Code uses **[bubblewrap (bwrap)](https://github.com/containers/bubblewrap)** — the same tool Flatpak uses — to sandbox every Bash subprocess. Bubblewrap leverages **user namespaces** (`CLONE_NEWUSER`) as its entry point, which enables unprivileged sandboxing without root.
+
+The isolation stack:
+
+| Layer | Namespace / Mechanism | What It Restricts |
+|:------|:---------------------|:------------------|
+| Filesystem | **Mount namespace** (`CLONE_NEWNS`) | Bind-mounts only allowed paths into the sandbox; everything else is invisible or read-only |
+| Network | Proxy + **network namespace** (`CLONE_NEWNET`) | All traffic is routed through a domain-allowlist proxy; unauthorized hosts are blocked |
+| Process visibility | **PID namespace** (`CLONE_NEWPID`) | Sandboxed processes cannot see or signal host processes |
+| Privileges | **User namespace** (`CLONE_NEWUSER`) | The sandbox runs as an unprivileged user mapping; no real root capabilities |
+
+### How It Works in Practice
+
+When Claude Code runs a sandboxed Bash command:
+
+```
+Claude Code (parent process)
+│
+├── Launches bwrap with:
+│   ├── CLONE_NEWUSER  → unprivileged namespace (no real root)
+│   ├── CLONE_NEWNS    → custom mount tree:
+│   │   ├── bind-mount project dir (read-write)
+│   │   ├── bind-mount /usr, /lib, etc. (read-only)
+│   │   ├── deny write to ~/, /etc, /bin
+│   │   └── fresh /tmp (isolated)
+│   ├── CLONE_NEWPID   → separate PID space
+│   └── Network proxy  → HTTP/SOCKS proxy enforcing domain allowlist
+│
+└── Child process (the user's command)
+    └── Sees: only the project directory as writable,
+              allowed network domains, isolated PID tree
+```
+
+### Filesystem Isolation via Mount Namespace
+
+The mount namespace is the workhorse. Bubblewrap constructs a minimal mount tree:
+
+- **Project directory**: bind-mounted read-write (the only writable location by default)
+- **System libraries** (`/usr`, `/lib`, `/lib64`): bind-mounted read-only so commands can execute
+- **Home directory** (`~/`): blocked or read-only (credentials like `~/.aws/`, `~/.ssh/` are hidden unless explicitly allowed)
+- **Settings files**: always deny-write protected so sandboxed commands cannot modify their own policy
+
+Additional write paths can be granted via `sandbox.filesystem.allowWrite`:
+
+```json
+{
+  "sandbox": {
+    "enabled": true,
+    "filesystem": {
+      "allowWrite": ["~/.kube", "/tmp/build"]
+    }
+  }
+}
+```
+
+### Network Isolation
+
+Rather than a full network namespace with no connectivity, Claude Code routes all sandboxed traffic through a **proxy server** running outside the sandbox:
+
+- First connection to a new domain triggers a user prompt
+- Approved domains are added to an allowlist
+- The proxy filters by hostname (SNI-based, no TLS termination)
+- `socat` relays traffic between the sandbox and the proxy
+
+This is a pragmatic trade-off: full `CLONE_NEWNET` isolation would break all network tools, while the proxy approach allows controlled egress.
+
+### The Ubuntu 24.04 Problem: AppArmor vs. User Namespaces
+
+A real-world friction point: Ubuntu 24.04+ defaults `kernel.apparmor_restrict_unprivileged_userns=1`, which prevents bubblewrap from creating the user namespace it needs.
+
+The fix is an AppArmor profile that grants `bwrap` the `userns` capability:
+
+```bash
+sudo tee /etc/apparmor.d/bwrap > /dev/null <<'EOF'
+abi <abi/4.0>,
+include <tunables/global>
+
+profile bwrap /usr/bin/bwrap flags=(unconfined) {
+  userns,
+  include if exists <local/bwrap>
+}
+EOF
+sudo systemctl reload apparmor
+```
+
+This illustrates a tension in the namespace design: user namespaces were meant to enable unprivileged isolation, but distributions increasingly restrict them because they expand the kernel attack surface (every `CLONE_NEWUSER` call gives the process access to kernel code paths normally reserved for root).
+
+### Why Not a Full Container?
+
+Claude Code could run commands in Docker, but that would be heavyweight for an interactive CLI tool. The bubblewrap approach is:
+- **Fast**: no daemon, no image pull, no layered filesystem — just `clone()` + bind-mounts
+- **Composable**: filesystem and network restrictions are configured independently
+- **Transparent**: commands behave normally; they just can't escape the boundary
+- **Unprivileged**: no root or Docker daemon required (just user namespaces)
+
+This is namespaces at their most surgical — using exactly the isolation primitives needed, nothing more.
+
+### Architecture Diagram
+
+```
+┌─────────────────────────────────────────────────────┐
+│  Host (your machine)                                │
+│                                                     │
+│  ┌───────────────────────────────────────────────┐  │
+│  │  Claude Code Process                          │  │
+│  │  (user namespace owner, proxy server)         │  │
+│  │                                               │  │
+│  │  settings.json ──► sandbox policy             │  │
+│  │       │                                       │  │
+│  │       ▼                                       │  │
+│  │  ┌─────────────────────────────────────────┐  │  │
+│  │  │  bwrap sandbox (per Bash command)       │  │  │
+│  │  │                                         │  │  │
+│  │  │  Mount NS: project/ (rw), /usr (ro)     │  │  │
+│  │  │  PID NS:   isolated process tree        │  │  │
+│  │  │  User NS:  unprivileged mapping         │  │  │
+│  │  │  Network:  proxy → allowlist filter     │  │  │
+│  │  │                                         │  │  │
+│  │  │  $ npm test   ← runs here              │  │  │
+│  │  │  $ git commit ← runs here              │  │  │
+│  │  └─────────────────────────────────────────┘  │  │
+│  └───────────────────────────────────────────────┘  │
+└─────────────────────────────────────────────────────┘
+```
+
+### Key Takeaway
+
+Claude Code's sandbox is a textbook example of **minimal namespace composition**: user namespaces for unprivileged entry, mount namespaces for filesystem boundaries, PID namespaces for process isolation, and a proxy-based network filter. It demonstrates that namespaces aren't just for full containerization — they're surgical tools for enforcing precise security boundaries in any application that spawns untrusted subprocesses.
