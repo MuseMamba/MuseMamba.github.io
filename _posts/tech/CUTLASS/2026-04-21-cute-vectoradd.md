@@ -301,20 +301,15 @@ def naive_add_kernel(
 
 ### Host Launch Function
 
-The `@cute.jit` decorator marks a host-side function that configures and launches the kernel. It runs on the CPU and sets up the grid/block dimensions.
+The `@cute.jit` decorator marks a host-side function that configures and launches the kernel. It runs on the CPU and sets up the grid/block dimensions. The function must be named `solve` with the signature `(A, B, C, N)` to match the LeetGPU challenge interface.
 
 ```python
 @cute.jit
-def naive_add(
-    mA: cute.Tensor,
-    mB: cute.Tensor,
-    mC: cute.Tensor,
-):
+def solve(A: cute.Tensor, B: cute.Tensor, C: cute.Tensor, N: cute.Uint32):
     threads_per_block = 256
-    n = cute.size(mA)
 
-    naive_add_kernel(mA, mB, mC).launch(
-        grid=((n + threads_per_block - 1) // threads_per_block, 1, 1),
+    naive_add_kernel(A, B, C).launch(
+        grid=((N + threads_per_block - 1) // threads_per_block, 1, 1),
         block=(threads_per_block, 1, 1),
     )
 ```
@@ -334,8 +329,8 @@ a_ = from_dlpack(a, assumed_align=16)
 b_ = from_dlpack(b, assumed_align=16)
 c_ = from_dlpack(c, assumed_align=16)
 
-naive_fn = cute.compile(naive_add, a_, b_, c_)
-naive_fn(a_, b_, c_)
+naive_fn = cute.compile(solve, a_, b_, c_, N)
+naive_fn(a_, b_, c_, N)
 
 torch.testing.assert_close(c, a + b)
 ```
@@ -404,17 +399,13 @@ The host function tiles each tensor before passing them to the kernel. `cute.zip
 
 ```python
 @cute.jit
-def vectorized_add(
-    mA: cute.Tensor,
-    mB: cute.Tensor,
-    mC: cute.Tensor,
-):
+def solve(A: cute.Tensor, B: cute.Tensor, C: cute.Tensor, N: cute.Uint32):
     threads_per_block = 256
 
     # Tile: each thread handles 4 contiguous float32 = 16 bytes = 128-bit
-    gA = cute.zipped_divide(mA, (4,))
-    gB = cute.zipped_divide(mB, (4,))
-    gC = cute.zipped_divide(mC, (4,))
+    gA = cute.zipped_divide(A, (4,))
+    gB = cute.zipped_divide(B, (4,))
+    gC = cute.zipped_divide(C, (4,))
 
     vec_n = cute.size(gC, mode=[1])
     vectorized_add_kernel(gA, gB, gC).launch(
@@ -434,8 +425,8 @@ a_ = from_dlpack(a, assumed_align=16)
 b_ = from_dlpack(b, assumed_align=16)
 c_ = from_dlpack(c, assumed_align=16)
 
-vec_fn = cute.compile(vectorized_add, a_, b_, c_)
-vec_fn(a_, b_, c_)
+vec_fn = cute.compile(solve, a_, b_, c_, N)
+vec_fn(a_, b_, c_, N)
 
 torch.testing.assert_close(c, a + b)
 ```
@@ -513,11 +504,11 @@ Breaking down the layout construction:
 
 ```python
 @cute.jit
-def tv_add(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
+def solve(A: cute.Tensor, B: cute.Tensor, C: cute.Tensor, N: cute.Uint32):
     coalesced_ldst_bytes = 16  # 128-bit = 16 bytes
 
-    assert all(t.element_type == mA.element_type for t in [mA, mB, mC])
-    dtype = mA.element_type
+    assert all(t.element_type == A.element_type for t in [A, B, C])
+    dtype = A.element_type
 
     # Thread layout: 256 threads in 1D
     thr_layout = cute.make_ordered_layout((256,), order=(0,))
@@ -526,9 +517,9 @@ def tv_add(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
     val_layout = cute.recast_layout(dtype.width, 8, val_layout)
     tiler_n, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
 
-    gA = cute.zipped_divide(mA, tiler_n)
-    gB = cute.zipped_divide(mB, tiler_n)
-    gC = cute.zipped_divide(mC, tiler_n)
+    gA = cute.zipped_divide(A, tiler_n)
+    gB = cute.zipped_divide(B, tiler_n)
+    gC = cute.zipped_divide(C, tiler_n)
 
     tv_add_kernel(gA, gB, gC, tv_layout).launch(
         grid=[cute.size(gC, mode=[1]), 1, 1],
