@@ -265,7 +265,7 @@ The same vector addition problem can be expressed using NVIDIA's **CuTe DSL** �
 
 **Why CuTe?** Raw CUDA gives you full control, but as kernels grow more complex (GEMM, attention, convolution), manually managing tile shapes, thread-to-data mappings, and memory access patterns becomes error-prone. CuTe lets you express these patterns declaratively — you describe the layout, and CuTe generates the indexing math for you.
 
-**CuTe uses float16** in the examples below (vs. float32 in the CUDA C++ section above). With float16, each element is 2 bytes, so a 128-bit (16-byte) load fetches 8 elements instead of 4.
+The examples below use **float32** (matching the CUDA C++ section). With float32 (4 bytes per element), a 128-bit (16-byte) vectorized load fetches 4 elements per instruction.
 
 ## Setup
 
@@ -284,7 +284,7 @@ CuTe separates GPU code into two pieces: a **kernel** (`@cute.kernel`) that runs
 
 ```python
 @cute.kernel
-def naive_elementwise_add_kernel(
+def naive_add_kernel(
     gA: cute.Tensor,
     gB: cute.Tensor,
     gC: cute.Tensor,
@@ -293,15 +293,10 @@ def naive_elementwise_add_kernel(
     bidx, _, _ = cute.arch.block_idx()
     bdim, _, _ = cute.arch.block_dim()
 
-    thread_idx = bidx * bdim + tidx
+    idx = bidx * bdim + tidx
 
-    m, n = gA.shape
-    ni = thread_idx % n
-    mi = thread_idx // n
-
-    a_val = gA[mi, ni]
-    b_val = gB[mi, ni]
-    gC[mi, ni] = a_val + b_val
+    if idx < cute.size(gA):
+        gC[idx] = gA[idx] + gB[idx]
 ```
 
 ### Host Launch Function
@@ -310,17 +305,17 @@ The `@cute.jit` decorator marks a host-side function that configures and launche
 
 ```python
 @cute.jit
-def naive_elementwise_add(
+def naive_add(
     mA: cute.Tensor,
     mB: cute.Tensor,
     mC: cute.Tensor,
 ):
-    num_threads_per_block = 256
-    m, n = mA.shape
+    threads_per_block = 256
+    n = cute.size(mA)
 
-    naive_elementwise_add_kernel(mA, mB, mC).launch(
-        grid=((m * n) // num_threads_per_block, 1, 1),
-        block=(num_threads_per_block, 1, 1),
+    naive_add_kernel(mA, mB, mC).launch(
+        grid=((n + threads_per_block - 1) // threads_per_block, 1, 1),
+        block=(threads_per_block, 1, 1),
     )
 ```
 
@@ -329,17 +324,17 @@ def naive_elementwise_add(
 CuTe uses a two-step process: `cute.compile` JIT-compiles the kernel to GPU machine code (PTX → SASS), and then you call the compiled function. The `assumed_align=16` parameter is critical — it tells the compiler that the memory pointers are 16-byte aligned, which is required for the compiler to emit vectorized 128-bit load/store instructions later.
 
 ```python
-M, N = 16384, 8192
+N = 25_000_000
 
-a = torch.randn(M, N, device="cuda", dtype=torch.float16)
-b = torch.randn(M, N, device="cuda", dtype=torch.float16)
-c = torch.zeros(M, N, device="cuda", dtype=torch.float16)
+a = torch.randn(N, device="cuda", dtype=torch.float32)
+b = torch.randn(N, device="cuda", dtype=torch.float32)
+c = torch.zeros(N, device="cuda", dtype=torch.float32)
 
 a_ = from_dlpack(a, assumed_align=16)
 b_ = from_dlpack(b, assumed_align=16)
 c_ = from_dlpack(c, assumed_align=16)
 
-naive_fn = cute.compile(naive_elementwise_add, a_, b_, c_)
+naive_fn = cute.compile(naive_add, a_, b_, c_)
 naive_fn(a_, b_, c_)
 
 torch.testing.assert_close(c, a + b)
@@ -347,27 +342,29 @@ torch.testing.assert_close(c, a + b)
 
 ### How It Works
 
-1. **Index calculation**: Each thread gets a unique global index `thread_idx = bidx * bdim + tidx`, then maps it to 2D coordinates `(mi, ni)` into the tensor.
+1. **Index calculation**: Each thread gets a unique global index `idx = bidx * bdim + tidx`.
 
-2. **1:1 mapping**: Each thread processes exactly one element. This is simple but means each load is a single scalar (2 bytes for float16).
+2. **Bounds check**: `if idx < cute.size(gA)` prevents out-of-bounds access, just like `if (idx < N)` in the CUDA C++ version.
 
-3. **Coalesced access**: Adjacent threads access adjacent columns (`ni = thread_idx % n`), so warps read contiguous memory — the hardware coalesces these into efficient 128-byte transactions.
+3. **1:1 mapping**: Each thread processes exactly one element. This is simple but means each load is a single scalar (4 bytes for float32).
+
+4. **Coalesced access**: Adjacent threads access adjacent elements, so warps read contiguous memory — the hardware coalesces these into efficient 128-byte transactions.
 
 ## Part 2: Vectorized with `zipped_divide`
 
-In the CUDA C++ version, we used `float4` and `reinterpret_cast` to manually group 4 floats into a single 128-bit load. CuTe provides a higher-level abstraction for the same idea: `cute.zipped_divide(tensor, tiler)` partitions a tensor into fixed-size tiles. For vectorization, the tiler specifies how many contiguous elements each thread should access — 8 float16 elements = 16 bytes = one 128-bit load.
+In the CUDA C++ version, we used `float4` and `reinterpret_cast` to manually group 4 floats into a single 128-bit load. CuTe provides a higher-level abstraction for the same idea: `cute.zipped_divide(tensor, tiler)` partitions a tensor into fixed-size tiles. For vectorization, the tiler specifies how many contiguous elements each thread should access — 4 float32 elements = 16 bytes = one 128-bit load.
 
 ### Key Insight: Vectorized Memory Access
 
-Instead of each thread loading one 2-byte float16, each thread can load **8 float16 values (16 bytes) in a single 128-bit instruction**:
+Instead of each thread loading one 4-byte float32, each thread can load **4 float32 values (16 bytes) in a single 128-bit instruction**:
 
 ```
-Naive:      Thread 0 loads A[0]     → 2 bytes, 1 instruction
-Vectorized: Thread 0 loads A[0:8]   → 16 bytes, 1 instruction (LDG.E.128)
+Naive:      Thread 0 loads A[0]     → 4 bytes, 1 instruction
+Vectorized: Thread 0 loads A[0:4]   → 16 bytes, 1 instruction (LDG.E.128)
 ```
 
 Benefits:
-- **8x fewer load instructions** (for float16) → less instruction scheduler pressure
+- **4x fewer load instructions** → less instruction scheduler pressure
 - **Better bus utilization** → each instruction carries more useful data
 - **More in-flight bytes** → better latency hiding per Little's Law
 
@@ -375,7 +372,7 @@ Benefits:
 
 ```python
 @cute.kernel
-def vectorized_elementwise_add_kernel(
+def vectorized_add_kernel(
     gA: cute.Tensor,
     gB: cute.Tensor,
     gC: cute.Tensor,
@@ -384,44 +381,44 @@ def vectorized_elementwise_add_kernel(
     bidx, _, _ = cute.arch.block_idx()
     bdim, _, _ = cute.arch.block_dim()
 
-    thread_idx = bidx * bdim + tidx
+    idx = bidx * bdim + tidx
 
-    # gA has been tiled by (1, 8) on the host side via zipped_divide.
-    # gA.shape is now ((1, 8), (M, N/8)).
-    # The 1st mode (1,8) is the per-thread tile (8 contiguous elements).
-    # The 2nd mode (M, N/8) indexes which tile each thread works on.
-    m, n = gA.shape[1]   # thread-domain shape
-    ni = thread_idx % n
-    mi = thread_idx // n
+    # gA has been tiled by (4,) on the host side via zipped_divide.
+    # gA.shape is now ((4,), (N/4,)).
+    # The 1st mode (4,) is the per-thread tile (4 contiguous float32 elements).
+    # The 2nd mode (N/4,) indexes which tile each thread works on.
+    n = gA.shape[1]
 
-    # .load() emits a single 128-bit LDG.E.128 instruction
-    a_vec = gA[(None, (mi, ni))].load()
-    b_vec = gB[(None, (mi, ni))].load()
+    if idx < n:
+        # .load() emits a single 128-bit LDG.E.128 instruction
+        a_vec = gA[(None, idx)].load()
+        b_vec = gB[(None, idx)].load()
 
-    # Elementwise add on the vector, then store (128-bit STG.E.128)
-    gC[(None, (mi, ni))] = a_vec + b_vec
+        # Elementwise add on the vector, then store (128-bit STG.E.128)
+        gC[(None, idx)] = a_vec + b_vec
 ```
 
 ### Host-Side: Tiling with `zipped_divide`
 
-The host function tiles each tensor before passing them to the kernel. `cute.zipped_divide(mA, (1, 8))` reshapes an `(M, N)` tensor into `((1, 8), (M, N/8))` — grouping every 8 contiguous column elements into a tile.
+The host function tiles each tensor before passing them to the kernel. `cute.zipped_divide(mA, (4,))` reshapes an `(N,)` tensor into `((4,), (N/4,))` — grouping every 4 contiguous elements into a tile.
 
 ```python
 @cute.jit
-def vectorized_elementwise_add(
+def vectorized_add(
     mA: cute.Tensor,
     mB: cute.Tensor,
     mC: cute.Tensor,
 ):
     threads_per_block = 256
 
-    # Tile: each thread handles 8 contiguous float16 = 16 bytes = 128-bit
-    gA = cute.zipped_divide(mA, (1, 8))
-    gB = cute.zipped_divide(mB, (1, 8))
-    gC = cute.zipped_divide(mC, (1, 8))
+    # Tile: each thread handles 4 contiguous float32 = 16 bytes = 128-bit
+    gA = cute.zipped_divide(mA, (4,))
+    gB = cute.zipped_divide(mB, (4,))
+    gC = cute.zipped_divide(mC, (4,))
 
-    vectorized_elementwise_add_kernel(gA, gB, gC).launch(
-        grid=(cute.size(gC, mode=[1]) // threads_per_block, 1, 1),
+    vec_n = cute.size(gC, mode=[1])
+    vectorized_add_kernel(gA, gB, gC).launch(
+        grid=((vec_n + threads_per_block - 1) // threads_per_block, 1, 1),
         block=(threads_per_block, 1, 1),
     )
 ```
@@ -429,15 +426,15 @@ def vectorized_elementwise_add(
 ### Running the Vectorized Kernel
 
 ```python
-a = torch.randn(M, N, device="cuda", dtype=torch.float16)
-b = torch.randn(M, N, device="cuda", dtype=torch.float16)
-c = torch.zeros(M, N, device="cuda", dtype=torch.float16)
+a = torch.randn(N, device="cuda", dtype=torch.float32)
+b = torch.randn(N, device="cuda", dtype=torch.float32)
+c = torch.zeros(N, device="cuda", dtype=torch.float32)
 
 a_ = from_dlpack(a, assumed_align=16)
 b_ = from_dlpack(b, assumed_align=16)
 c_ = from_dlpack(c, assumed_align=16)
 
-vec_fn = cute.compile(vectorized_elementwise_add, a_, b_, c_)
+vec_fn = cute.compile(vectorized_add, a_, b_, c_)
 vec_fn(a_, b_, c_)
 
 torch.testing.assert_close(c, a + b)
@@ -448,32 +445,32 @@ torch.testing.assert_close(c, a + b)
 Let's trace what happens step by step:
 
 ```
-Original tensor mA:  shape (M, N), layout (N, 1)
-                     e.g. (2048, 2048):(2048, 1)
+Original tensor mA:  shape (N,), layout (1,)
+                     e.g. (25000000,):(1,)
 
-After zipped_divide(mA, (1, 8)):
-  shape:  ((1, 8), (2048, 256))
-  layout: ((0, 1), (2048, 8))
-           ~~~~~~  ~~~~~~~~~~
-             |         |
-             |         └── indexes which tile (which thread works on it)
-             └── per-thread tile: 8 contiguous elements
+After zipped_divide(mA, (4,)):
+  shape:  ((4,), (6250000,))
+  layout: ((1,), (4,))
+           ~~~~  ~~~~~~~~~
+            |        |
+            |        └── indexes which tile (which thread works on it)
+            └── per-thread tile: 4 contiguous float32 elements
 ```
 
-When thread `t` accesses `gA[(None, (mi, ni))].load()`:
-- `(mi, ni)` selects which tile
-- `None` means "give me the entire tile" — all 8 elements
-- `.load()` compiles to a single `LDG.E.128` instruction because the 8 float16 values are contiguous and 16-byte aligned
+When thread `t` accesses `gA[(None, idx)].load()`:
+- `idx` selects which tile
+- `None` means "give me the entire tile" — all 4 elements
+- `.load()` compiles to a single `LDG.E.128` instruction because the 4 float32 values are contiguous and 16-byte aligned
 
 ## Part 3: Advanced — TV Layout
 
 For production kernels, CuTe offers **TV (Thread-Value) Layout** — a rank-2 layout that maps `(thread_index, value_index)` directly to tensor coordinates. This decouples the thread-to-data mapping from the kernel logic, making it easy to experiment with different access patterns.
 
-In the previous approaches, the kernel itself computed which data each thread should access (the `mi`, `ni` index math). With TV layout, that mapping is defined **outside the kernel** as a layout object and passed in. The kernel simply says "give me my data" — it doesn't need to know how the data was partitioned.
+In the previous approaches, the kernel itself computed which data each thread should access (the index math). With TV layout, that mapping is defined **outside the kernel** as a layout object and passed in. The kernel simply says "give me my data" — it doesn't need to know how the data was partitioned.
 
 ```python
 @cute.kernel
-def elementwise_add_kernel(
+def tv_add_kernel(
     gA: cute.Tensor,
     gB: cute.Tensor,
     gC: cute.Tensor,
@@ -483,14 +480,14 @@ def elementwise_add_kernel(
     bidx, _, _ = cute.arch.block_idx()
 
     # Slice to get this thread-block's tile
-    blk_coord = ((None, None), bidx)
+    blk_coord = (None, bidx)
     blkA = gA[blk_coord]
     blkB = gB[blk_coord]
     blkC = gC[blk_coord]
 
     # Compose block-local tensor with TV layout:
-    # blkA maps (TileM, TileN) → physical address
-    # tv_layout maps (tid, vid) → (TileM, TileN)
+    # blkA maps (TileN,) → physical address
+    # tv_layout maps (tid, vid) → (TileN,)
     # composition maps (tid, vid) → physical address
     tidfrgA = cute.composition(blkA, tv_layout)
     tidfrgB = cute.composition(blkB, tv_layout)
@@ -507,33 +504,33 @@ def elementwise_add_kernel(
 
 ### TV Layout Host Code
 
-The host constructs a TV layout that maps 256 threads to a `(64, 512)` tile, with each thread loading 16 contiguous bytes per row across multiple rows.
+The host constructs a TV layout that maps 256 threads to a tile, with each thread loading 16 contiguous bytes (4 float32 elements) per vectorized access.
 
 Breaking down the layout construction:
-- **Thread layout** `(4, 64)`: arranges 256 threads (4 × 64) into a 2D grid — 4 rows of 64 threads. The `order=(1, 0)` means threads are numbered along columns first (thread 0 and 1 are in the same row, adjacent columns).
-- **Value layout** `(16, 16)`: each thread handles a 16×16-byte region. `recast_layout` converts the byte-level layout to element-level (for float16: 16 bytes = 8 elements per column).
-- **`make_layout_tv`**: combines thread and value layouts into a single TV layout and returns the tile shape `tiler_mn` that `zipped_divide` needs.
+- **Thread layout** `(256,)`: 256 threads in a 1D arrangement.
+- **Value layout** `(coalesced_ldst_bytes,)`: each thread reads 16 bytes. `recast_layout` converts the byte-level layout to element-level (for float32: 16 bytes = 4 elements).
+- **`make_layout_tv`**: combines thread and value layouts into a single TV layout and returns the tile shape `tiler_n` that `zipped_divide` needs.
 
 ```python
 @cute.jit
-def elementwise_add(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
+def tv_add(mA: cute.Tensor, mB: cute.Tensor, mC: cute.Tensor):
     coalesced_ldst_bytes = 16  # 128-bit = 16 bytes
 
     assert all(t.element_type == mA.element_type for t in [mA, mB, mC])
     dtype = mA.element_type
 
-    # Thread layout: 4 rows × 64 columns (64 threads read contiguous columns)
-    thr_layout = cute.make_ordered_layout((4, 64), order=(1, 0))
-    # Value layout: each thread reads 16 × 16 bytes, recast to element type
-    val_layout = cute.make_ordered_layout((16, coalesced_ldst_bytes), order=(1, 0))
+    # Thread layout: 256 threads in 1D
+    thr_layout = cute.make_ordered_layout((256,), order=(0,))
+    # Value layout: each thread reads 16 bytes, recast to element type
+    val_layout = cute.make_ordered_layout((coalesced_ldst_bytes,), order=(0,))
     val_layout = cute.recast_layout(dtype.width, 8, val_layout)
-    tiler_mn, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
+    tiler_n, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
 
-    gA = cute.zipped_divide(mA, tiler_mn)
-    gB = cute.zipped_divide(mB, tiler_mn)
-    gC = cute.zipped_divide(mC, tiler_mn)
+    gA = cute.zipped_divide(mA, tiler_n)
+    gB = cute.zipped_divide(mB, tiler_n)
+    gC = cute.zipped_divide(mC, tiler_n)
 
-    elementwise_add_kernel(gA, gB, gC, tv_layout).launch(
+    tv_add_kernel(gA, gB, gC, tv_layout).launch(
         grid=[cute.size(gC, mode=[1]), 1, 1],
         block=[cute.size(tv_layout, mode=[0]), 1, 1],
     )
@@ -545,7 +542,7 @@ The TV layout separates **what each thread does** from **how data is arranged in
 
 ### CuTe DSL Performance
 
-| Kernel | Bandwidth (H100, float16) | % of Peak (3.35 TB/s) |
+| Kernel | Bandwidth (H100, float32) | % of Peak (3.35 TB/s) |
 |--------|---------------------------|------------------------|
 | Naive (scalar loads) | ~1.0–1.3 TB/s | ~30–40% |
 | Vectorized (zipped_divide) | ~2.8–3.1 TB/s | ~85–93% |
@@ -556,8 +553,8 @@ The TV layout separates **what each thread does** from **how data is arranged in
 
 | Technique | What It Does | Why It Helps |
 |-----------|-------------|--------------|
-| `zipped_divide(tensor, (1, 8))` | Tiles tensor so each thread gets 8 elements | Enables 128-bit vectorized load/store |
-| `.load()` on tiled slice | Emits single `LDG.E.128` instruction | 8x fewer instructions vs scalar |
+| `zipped_divide(tensor, (4,))` | Tiles tensor so each thread gets 4 float32 elements | Enables 128-bit vectorized load/store |
+| `.load()` on tiled slice | Emits single `LDG.E.128` instruction | 4x fewer instructions vs scalar |
 | `from_dlpack(t, assumed_align=16)` | Guarantees 16-byte pointer alignment | Required for compiler to emit vectorized instructions |
 | `cute.composition(tensor, tv_layout)` | Maps (thread, value) → physical address | Decouples access pattern from kernel logic |
 
