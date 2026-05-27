@@ -37,7 +37,7 @@ favicon:
 permalink: /:year/:month/:day/:title.html
 markdown: kramdown
 highlighter: rouge
-mathjax: disabled
+mathjax: true
 sass:
   style: compressed
 
