@@ -288,6 +288,7 @@ def naive_add_kernel(
     gA: cute.Tensor,
     gB: cute.Tensor,
     gC: cute.Tensor,
+    N: cute.Uint32,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
@@ -295,7 +296,7 @@ def naive_add_kernel(
 
     idx = bidx * bdim + tidx
 
-    if idx < cute.size(gA):
+    if idx < N:
         gC[idx] = gA[idx] + gB[idx]
 ```
 
@@ -308,7 +309,7 @@ The `@cute.jit` decorator marks a host-side function that configures and launche
 def solve(A: cute.Tensor, B: cute.Tensor, C: cute.Tensor, N: cute.Uint32):
     threads_per_block = 256
 
-    naive_add_kernel(A, B, C).launch(
+    naive_add_kernel(A, B, C, N).launch(
         grid=((N + threads_per_block - 1) // threads_per_block, 1, 1),
         block=(threads_per_block, 1, 1),
     )
@@ -339,7 +340,7 @@ torch.testing.assert_close(c, a + b)
 
 1. **Index calculation**: Each thread gets a unique global index `idx = bidx * bdim + tidx`.
 
-2. **Bounds check**: `if idx < cute.size(gA)` prevents out-of-bounds access, just like `if (idx < N)` in the CUDA C++ version.
+2. **Bounds check**: `if idx < N` prevents out-of-bounds access, just like `if (idx < N)` in the CUDA C++ version. `N` is passed from the host as a `cute.Uint32` scalar.
 
 3. **1:1 mapping**: Each thread processes exactly one element. This is simple but means each load is a single scalar (4 bytes for float32).
 
@@ -371,6 +372,7 @@ def vectorized_add_kernel(
     gA: cute.Tensor,
     gB: cute.Tensor,
     gC: cute.Tensor,
+    vec_N: cute.Uint32,
 ):
     tidx, _, _ = cute.arch.thread_idx()
     bidx, _, _ = cute.arch.block_idx()
@@ -382,9 +384,7 @@ def vectorized_add_kernel(
     # gA.shape is now ((4,), (N/4,)).
     # The 1st mode (4,) is the per-thread tile (4 contiguous float32 elements).
     # The 2nd mode (N/4,) indexes which tile each thread works on.
-    n = gA.shape[1]
-
-    if idx < n:
+    if idx < vec_N:
         # .load() emits a single 128-bit LDG.E.128 instruction
         a_vec = gA[(None, idx)].load()
         b_vec = gB[(None, idx)].load()
@@ -395,7 +395,7 @@ def vectorized_add_kernel(
 
 ### Host-Side: Tiling with `zipped_divide`
 
-The host function tiles each tensor before passing them to the kernel. `cute.zipped_divide(mA, (4,))` reshapes an `(N,)` tensor into `((4,), (N/4,))` — grouping every 4 contiguous elements into a tile.
+The host function tiles each tensor before passing them to the kernel. `cute.zipped_divide(A, (4,))` reshapes an `(N,)` tensor into `((4,), (N/4,))` — grouping every 4 contiguous elements into a tile.
 
 ```python
 @cute.jit
@@ -407,8 +407,8 @@ def solve(A: cute.Tensor, B: cute.Tensor, C: cute.Tensor, N: cute.Uint32):
     gB = cute.zipped_divide(B, (4,))
     gC = cute.zipped_divide(C, (4,))
 
-    vec_n = cute.size(gC, mode=[1])
-    vectorized_add_kernel(gA, gB, gC).launch(
+    vec_n = N // 4
+    vectorized_add_kernel(gA, gB, gC, vec_n).launch(
         grid=((vec_n + threads_per_block - 1) // threads_per_block, 1, 1),
         block=(threads_per_block, 1, 1),
     )
