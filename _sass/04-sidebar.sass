@@ -35,9 +35,24 @@
   border: $avatar-border-size solid $avatar-border-color
   border-radius: 50%
   overflow: hidden
+  text-decoration: none
   &-img
     display: block
     width: 100%
+
+#sidebar-home-text
+  display: flex
+  align-items: center
+  justify-content: center
+  width: 100%
+  height: $avatar-size
+  font-size: 14px
+  font-weight: 600
+  color: $tag-color
+  letter-spacing: 1px
+  transition: color .15s linear
+  &:hover
+    color: $tag-active-color
 
 
 #sidebar-social

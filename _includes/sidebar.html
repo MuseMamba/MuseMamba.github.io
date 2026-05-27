@@ -1,7 +1,11 @@
 <aside id="sidebar" class="open">
   <div id="sidebar-left">
     <a id="sidebar-avatar" href="{{ "/" | prepend: site.baseurl }}">
-      <img id="sidebar-avatar-img" alt="{{ site.tittle }}" src="{{ site.avatar | prepend: site.baseurl }}"/>
+      {% if site.avatar != "" %}
+        <img id="sidebar-avatar-img" alt="{{ site.title }}" src="{{ site.avatar | prepend: site.baseurl }}"/>
+      {% else %}
+        <span id="sidebar-home-text">Home</span>
+      {% endif %}
     </a>
 
     <div id="sidebar-social">
