@@ -13,6 +13,8 @@ reference: "https://leetgpu.com/challenges/vector-addition"
 
 Vector addition is the "hello world" of GPU programming: `C[i] = A[i] + B[i]` for every element. It's trivially parallel — every element is independent — which makes it the perfect playground to learn how memory access patterns determine GPU performance.
 
+**Why GPU?** A CPU processes elements one at a time (or a few at a time with SIMD). A GPU has thousands of lightweight cores that can process thousands of elements simultaneously. For vector addition on 25 million elements, a CPU iterates 25 million times; a GPU launches 25 million threads that all run at once.
+
 ## Background: How a GPU Executes Work
 
 Before diving into code, let's establish the execution model:
@@ -23,6 +25,22 @@ Before diving into code, let's establish the execution model:
 - **Warp**: A hardware scheduling unit of 32 threads within a block. All 32 threads in a warp execute the same instruction simultaneously (SIMT).
 
 When you launch a kernel, the GPU maps your grid of blocks onto its Streaming Multiprocessors (SMs). Each SM runs one or more blocks concurrently.
+
+Here's how these levels relate to each other:
+
+```
+Grid (entire problem)
+├── Block 0  (up to 1024 threads)
+│   ├── Warp 0  (threads 0–31)
+│   ├── Warp 1  (threads 32–63)
+│   └── ...
+├── Block 1
+│   ├── Warp 0
+│   └── ...
+└── ...
+```
+
+You specify the grid and block sizes at launch time. The hardware handles warps automatically — you never create warps explicitly.
 
 ## Understanding the H100 Memory System
 
@@ -37,7 +55,11 @@ The NVIDIA H100 (Hopper architecture) has a memory hierarchy designed for massiv
 
 Vector addition is **memory-bound** — the computation (one add per element) is trivial. The GPU spends almost all its time waiting for data from HBM3. Our job is to maximize memory bandwidth utilization.
 
+**What does "memory-bound" mean?** Every kernel is bottlenecked by either computation (math instructions) or memory (loading/storing data). Vector addition does 1 add per 12 bytes transferred (read A, read B, write C — each 4 bytes for float32). The GPU can do far more math than this in the time it takes to fetch the data, so the memory bus is the bottleneck. Optimizing a memory-bound kernel means getting data in and out of HBM as fast as possible.
+
 ## Part 1: The Naive Kernel
+
+A CUDA kernel is a function that runs on the GPU. The `__global__` keyword tells the compiler this function is called from the CPU but executes on the GPU. Every thread runs the same kernel code, but each thread has a different `threadIdx` and `blockIdx` — built-in variables that let each thread figure out which element it should work on.
 
 ```cpp
 __global__ void naive_add_kernel(const float* A, const float* B, float* C, int N) {
@@ -54,11 +76,13 @@ void solve(const float* A, const float* B, float* C, int N) {
 }
 ```
 
+The `solve` function is the **host-side** launcher — it runs on the CPU. The `<<<blocks, threads_per_block>>>` syntax is CUDA's kernel launch syntax: it tells the GPU how many blocks to create and how many threads per block. The formula `(N + threads_per_block - 1) / threads_per_block` is ceiling division — it ensures we launch enough threads to cover all N elements, even when N isn't perfectly divisible by the block size.
+
 ### How It Works
 
-1. **Index calculation**: Each thread gets a unique global index `idx = blockIdx.x * blockDim.x + threadIdx.x`.
+1. **Index calculation**: Each thread computes its unique global index `idx = blockIdx.x * blockDim.x + threadIdx.x`. Think of it like this: if you have 256 threads per block, then block 0 has threads 0–255, block 1 has threads 256–511, and so on. `blockIdx.x * blockDim.x` gives the starting index of the block, and `threadIdx.x` is the thread's position within that block.
 
-2. **Bounds check**: `if (idx < N)` prevents out-of-bounds access when N isn't a multiple of the block size.
+2. **Bounds check**: `if (idx < N)` prevents out-of-bounds access when N isn't a multiple of the block size. For example, if N = 1000 and we launch 4 blocks of 256 threads (1024 threads total), the last 24 threads have `idx >= 1000` and must do nothing.
 
 3. **Coalesced access**: Adjacent threads access adjacent memory addresses, so warps read contiguous memory — the hardware coalesces these into efficient 128-byte transactions.
 
@@ -66,11 +90,15 @@ void solve(const float* A, const float* B, float* C, int N) {
 
 The naive kernel typically achieves only 30–40% of peak HBM3 bandwidth on H100. The problem is **instruction overhead**: each thread issues one 4-byte load instruction per element. The memory controller coalesces warp-level accesses, but the instruction scheduler is overwhelmed by the sheer number of individual load/store instructions.
 
+To understand why, consider what each thread does: it issues 2 load instructions (one for `A[idx]`, one for `B[idx]`), 1 add, and 1 store. That's 3 memory instructions per element, each moving only 4 bytes. The GPU's instruction pipeline has limited throughput — it can only dispatch so many instructions per cycle. When every instruction moves so little data, the pipeline becomes the bottleneck, not the memory bus itself.
+
 ## Part 2: Vectorized with `float4`
 
 ### Key Insight: Vectorized Memory Access
 
-Instead of each thread loading one 4-byte float, each thread can load **4 floats (16 bytes) in a single 128-bit instruction**:
+The GPU memory bus is wide — each memory transaction fetches 128 bytes (a full cache line). In the naive kernel, each thread requests only 4 bytes, but the hardware still fetches the full 128-byte cache line. The data isn't wasted (neighboring threads use adjacent parts of the same cache line), but each thread pays the cost of issuing a separate instruction for just 4 bytes.
+
+**Vectorization** means loading more data per instruction. Instead of each thread loading one 4-byte float, each thread can load **4 floats (16 bytes) in a single 128-bit instruction**:
 
 ```
 Naive:      Thread 0 loads A[0]     → 4 bytes,  1 instruction
@@ -83,6 +111,8 @@ Benefits:
 - **More in-flight bytes** → better latency hiding per Little's Law
 
 ### The Vectorized Kernel
+
+The idea is simple: treat the `float` array as an array of `float4` (a struct of 4 floats), so each thread processes 4 elements at once. Since N might not be divisible by 4, we handle the leftover "tail" elements separately with scalar loads.
 
 ```cpp
 __global__ void vectorized_add_kernel(const float* A, const float* B, float* C, int N) {
@@ -123,13 +153,13 @@ void solve(const float* A, const float* B, float* C, int N) {
 
 ### How `float4` Enables Vectorization
 
-`float4` is a CUDA built-in type — a struct of four 32-bit floats, 16 bytes total, naturally aligned to 16 bytes. When you load a `float4`, the compiler emits a single `LDG.E.128` instruction that fetches all 16 bytes in one shot.
+`float4` is a CUDA built-in type — a struct with four members (`x`, `y`, `z`, `w`), each a 32-bit float, 16 bytes total. It's naturally aligned to 16 bytes in memory. When you load a `float4`, the compiler emits a single `LDG.E.128` instruction that fetches all 16 bytes in one shot — the same work that would take 4 separate instructions with scalar `float` loads.
 
-The `reinterpret_cast<const float4*>(A)` tells the compiler to treat the float array as an array of `float4`. Since `A[idx]` on a `float4*` accesses 4 contiguous floats, the compiler knows it can use a 128-bit load.
+The `reinterpret_cast<const float4*>(A)` tells the compiler to treat the float array as an array of `float4`. This doesn't copy or rearrange any data — it just changes how the pointer arithmetic works. `A4[idx]` now accesses 4 contiguous floats starting at `A[idx * 4]`, and the compiler knows it can use a 128-bit load.
 
 ### What Is Memory Coalescing?
 
-When 32 threads in a warp access addresses within the same 128-byte aligned region, the hardware serves all requests in a **single memory transaction**:
+GPUs don't fetch individual bytes from memory. Instead, the memory controller works in **transactions** — fixed-size chunks of 128 bytes (a cache line). When 32 threads in a warp access addresses within the same 128-byte aligned region, the hardware serves all requests in a **single memory transaction**:
 
 ```
 Good (coalesced):
@@ -149,7 +179,9 @@ With `float4`, each thread accesses 16 contiguous bytes, and adjacent threads ac
 
 ## Part 3: Grid-Stride Loop (Production Pattern)
 
-For large N (25 million elements), we want each thread to process **multiple chunks** via a grid-stride loop. This reduces launch overhead and lets a smaller grid saturate the memory bus.
+In Parts 1 and 2, we launched one thread per element (or per `float4` chunk). For N = 25 million, that means launching ~6.25 million threads — which means ~24,400 blocks. This works, but it's not ideal: launching that many blocks has overhead, and the GPU only has 132 SMs. Most blocks sit in a queue waiting for an SM to become available.
+
+The **grid-stride loop** pattern takes a different approach: launch a **fixed, modest number** of threads, and have each thread process **multiple elements** by walking through the array in strides.
 
 ```cpp
 __global__ void gridstride_add_kernel(const float* A, const float* B, float* C, int N) {
@@ -182,9 +214,19 @@ void solve(const float* A, const float* B, float* C, int N) {
 
 ### Why Grid-Stride?
 
-With N = 25,000,000 and `float4`, there are 6,250,000 vector elements to process. A grid of 256 blocks × 256 threads = 65,536 threads, so each thread handles ~95 `float4` chunks.
+The key line is `for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < vec_N; idx += stride)`. Each thread starts at its global index and jumps forward by `stride` (the total number of threads in the grid) on each iteration. This guarantees every element is covered exactly once, and adjacent threads always access adjacent memory — preserving coalescing.
 
-The grid-stride pattern `for (idx = global_tid; idx < vec_N; idx += stride)` lets every thread walk through the array in steps equal to the total grid width. Benefits:
+With N = 25,000,000 and `float4`, there are 6,250,000 vector elements to process. A grid of 256 blocks × 256 threads = 65,536 threads, so each thread handles ~95 `float4` chunks. Here's a visual of how threads walk through the array:
+
+```
+Thread 0:  processes elements 0, 65536, 131072, ...
+Thread 1:  processes elements 1, 65537, 131073, ...
+Thread 2:  processes elements 2, 65538, 131074, ...
+...
+Thread 65535: processes elements 65535, 131071, ...
+```
+
+Benefits:
 
 - **Fixed grid size**: the number of blocks doesn't scale with N — you choose the grid size for optimal occupancy
 - **Better cache behavior**: threads in a block stay close together in address space across iterations, improving L2 hit rate
@@ -219,9 +261,15 @@ The remaining gap comes from kernel launch overhead, TLB misses on large tensors
 
 # CuTe DSL Version
 
-The same vector addition problem can be expressed using NVIDIA's **CuTe DSL** — a Python-embedded domain-specific language from the CUTLASS library. CuTe provides higher-level abstractions (`zipped_divide`, TV layouts, `.load()`) that compile down to the same PTX instructions as the raw CUDA C++ above, but let you manipulate tensor layouts algebraically.
+The same vector addition problem can be expressed using NVIDIA's **CuTe DSL** — a Python-embedded domain-specific language from the [CUTLASS](https://github.com/NVIDIA/cutlass) library. CuTe provides higher-level abstractions (`zipped_divide`, TV layouts, `.load()`) that compile down to the same PTX instructions as the raw CUDA C++ above, but let you manipulate tensor layouts algebraically.
+
+**Why CuTe?** Raw CUDA gives you full control, but as kernels grow more complex (GEMM, attention, convolution), manually managing tile shapes, thread-to-data mappings, and memory access patterns becomes error-prone. CuTe lets you express these patterns declaratively — you describe the layout, and CuTe generates the indexing math for you.
+
+**CuTe uses float16** in the examples below (vs. float32 in the CUDA C++ section above). With float16, each element is 2 bytes, so a 128-bit (16-byte) load fetches 8 elements instead of 4.
 
 ## Setup
+
+CuTe DSL programs use PyTorch tensors as input and the `cutlass` Python package for kernel compilation. `from_dlpack` converts a PyTorch tensor into a CuTe tensor without copying data — it just wraps the same GPU memory with CuTe's layout metadata.
 
 ```python
 import torch
@@ -231,6 +279,8 @@ from cutlass.cute.runtime import from_dlpack
 ```
 
 ## Part 1: Naive CuTe Kernel
+
+CuTe separates GPU code into two pieces: a **kernel** (`@cute.kernel`) that runs on the GPU, and a **host function** (`@cute.jit`) that runs on the CPU to configure and launch the kernel. This is analogous to the `__global__` kernel + host `solve` function in CUDA C++.
 
 ```python
 @cute.kernel
@@ -276,6 +326,8 @@ def naive_elementwise_add(
 
 ### Running It
 
+CuTe uses a two-step process: `cute.compile` JIT-compiles the kernel to GPU machine code (PTX → SASS), and then you call the compiled function. The `assumed_align=16` parameter is critical — it tells the compiler that the memory pointers are 16-byte aligned, which is required for the compiler to emit vectorized 128-bit load/store instructions later.
+
 ```python
 M, N = 16384, 8192
 
@@ -303,7 +355,7 @@ torch.testing.assert_close(c, a + b)
 
 ## Part 2: Vectorized with `zipped_divide`
 
-CuTe provides `cute.zipped_divide(tensor, tiler)` to partition a tensor into fixed-size tiles. For vectorization, the tiler specifies how many contiguous elements each thread should access — 8 float16 elements = 16 bytes = one 128-bit load.
+In the CUDA C++ version, we used `float4` and `reinterpret_cast` to manually group 4 floats into a single 128-bit load. CuTe provides a higher-level abstraction for the same idea: `cute.zipped_divide(tensor, tiler)` partitions a tensor into fixed-size tiles. For vectorization, the tiler specifies how many contiguous elements each thread should access — 8 float16 elements = 16 bytes = one 128-bit load.
 
 ### Key Insight: Vectorized Memory Access
 
@@ -417,6 +469,8 @@ When thread `t` accesses `gA[(None, (mi, ni))].load()`:
 
 For production kernels, CuTe offers **TV (Thread-Value) Layout** — a rank-2 layout that maps `(thread_index, value_index)` directly to tensor coordinates. This decouples the thread-to-data mapping from the kernel logic, making it easy to experiment with different access patterns.
 
+In the previous approaches, the kernel itself computed which data each thread should access (the `mi`, `ni` index math). With TV layout, that mapping is defined **outside the kernel** as a layout object and passed in. The kernel simply says "give me my data" — it doesn't need to know how the data was partitioned.
+
 ```python
 @cute.kernel
 def elementwise_add_kernel(
@@ -453,7 +507,12 @@ def elementwise_add_kernel(
 
 ### TV Layout Host Code
 
-The host constructs a TV layout that maps 256 threads to a `(64, 512)` tile, with each thread loading 16 contiguous bytes per row across multiple rows:
+The host constructs a TV layout that maps 256 threads to a `(64, 512)` tile, with each thread loading 16 contiguous bytes per row across multiple rows.
+
+Breaking down the layout construction:
+- **Thread layout** `(4, 64)`: arranges 256 threads (4 × 64) into a 2D grid — 4 rows of 64 threads. The `order=(1, 0)` means threads are numbered along columns first (thread 0 and 1 are in the same row, adjacent columns).
+- **Value layout** `(16, 16)`: each thread handles a 16×16-byte region. `recast_layout` converts the byte-level layout to element-level (for float16: 16 bytes = 8 elements per column).
+- **`make_layout_tv`**: combines thread and value layouts into a single TV layout and returns the tile shape `tiler_mn` that `zipped_divide` needs.
 
 ```python
 @cute.jit
