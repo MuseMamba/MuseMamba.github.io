@@ -97,11 +97,26 @@ $(function() {
   // Tags Filter
   $('#sidebar-tags').on('click', '.sidebar-tag', function() {
     var filter = $(this).data('filter');
+    var subfilter = $(this).data('subfilter');
+    var isSubtag = $(this).hasClass('sidebar-subtag');
     toc.hide();
+
+    // Hide all subtags first
+    $('.sidebar-subtag').removeClass('visible');
+
     if (filter === 'recent') {
       toc.slice(0, {{ site.recent_num }}).fadeIn(350);
+    } else if (subfilter) {
+      // Clicked a subtag — filter by category + subcategory
+      $('.toc-link[data-tags~=' + filter + '][data-subcategory=' + subfilter + ']').fadeIn(350);
+      // Keep subtags of this parent visible
+      $(this).siblings('.sidebar-subtag[data-filter=' + filter + ']').addClass('visible');
+      $(this).addClass('visible');
     } else {
+      // Clicked a parent category — show all posts in this category
       $('.toc-link[data-tags~=' + filter + ']').fadeIn(350);
+      // Show subtags belonging to this category
+      $(this).nextUntil('.sidebar-tag:not(.sidebar-subtag)').filter('.sidebar-subtag').addClass('visible');
     }
     $(this).addClass('active').siblings().removeClass('active');
   });

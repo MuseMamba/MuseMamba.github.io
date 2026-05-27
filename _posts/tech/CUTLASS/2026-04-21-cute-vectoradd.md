@@ -2,6 +2,7 @@
 layout: post
 title: "Use cute to implement vector addition"
 category: 技术
+subcategory: CUTLASS
 tags: [CUTE, Vector Addition, GPU Programming]
 keywords: ["CUTE", "Vector Addition", "GPU Programming", "CUDA", "Performance Optimization"]
 description: "Using the CUTE library to implement vector addition on the GPU, demonstrating how to leverage CUTE's features for efficient parallel computation."

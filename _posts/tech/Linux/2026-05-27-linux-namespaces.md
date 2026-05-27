@@ -2,6 +2,7 @@
 layout: post
 title: "Linux Namespaces: From First Principles to Kernel Implementation"
 category: 技术
+subcategory: Linux
 tags: [Linux, Namespace, Kernel, Container]
 keywords: ["Linux Namespace", "Container Isolation", "clone", "unshare", "setns", "nsproxy"]
 description: "A first-principles walkthrough of Linux namespaces — the 8 types, userspace APIs, and kernel implementation details."

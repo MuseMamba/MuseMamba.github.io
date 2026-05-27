@@ -15,6 +15,24 @@
       {% if site.filter == 'category' %}
         {% for category in site.categories %}
           <li class="sidebar-tag" data-filter="{{ category | first }}">{{ category | first }}</li>
+          {% assign subcats = "" %}
+          {% for post in category[1] %}
+            {% if post.subcategory %}
+              {% unless subcats contains post.subcategory %}
+                {% if subcats == "" %}
+                  {% assign subcats = post.subcategory %}
+                {% else %}
+                  {% assign subcats = subcats | append: "," | append: post.subcategory %}
+                {% endif %}
+              {% endunless %}
+            {% endif %}
+          {% endfor %}
+          {% if subcats != "" %}
+            {% assign subcat_array = subcats | split: "," %}
+            {% for subcat in subcat_array %}
+              <li class="sidebar-tag sidebar-subtag" data-filter="{{ category | first }}" data-subfilter="{{ subcat }}">{{ subcat }}</li>
+            {% endfor %}
+          {% endif %}
         {% endfor %}
       {% elsif site.filter == 'tag' %}
         {% for tag in site.tags %}
@@ -32,13 +50,13 @@
     <nav id="toc">
       {% if site.filter == 'category' %}
         {% for post in site.posts %}
-          <a class="toc-link" data-tags="{{ post.categories | join: ' ' }}" href="{{ post.url }}">
+          <a class="toc-link" data-tags="{{ post.categories | join: ' ' }}" data-subcategory="{{ post.subcategory }}" href="{{ post.url }}">
             {{ post.title }}
           </a>
         {% endfor %}
       {% elsif site.filter == 'tag' %}
         {% for post in site.posts %}
-          <a class="toc-link" data-tags="{{ post.tags | join: ' ' }}" href="{{ post.url }}">
+          <a class="toc-link" data-tags="{{ post.tags | join: ' ' }}" data-subcategory="{{ post.subcategory }}" href="{{ post.url }}">
             {{ post.title }}
           </a>
         {% endfor %}
