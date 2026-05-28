@@ -13,7 +13,7 @@ reference: "https://leetgpu.com/challenges/vector-addition"
 
 Vector addition is the "hello world" of GPU programming: `C[i] = A[i] + B[i]` for every element. It's trivially parallel — every element is independent — which makes it the perfect playground to learn how memory access patterns determine GPU performance.
 
-**Why GPU?** A CPU processes elements one at a time (or a few at a time with SIMD). A GPU has thousands of lightweight cores that can process thousands of elements simultaneously. For vector addition on 25 million elements, a CPU iterates 25 million times; a GPU launches 25 million threads that all run at once.
+**Why GPU?** A CPU processes elements one at a time (or a few at a time with SIMD). A GPU has thousands of lightweight cores that can process thousands of elements concurrently. For vector addition on 25 million elements, a CPU iterates through the array; a GPU launches many blocks of threads and schedules them across SMs in waves until the whole vector is covered.
 
 ## Background: How a GPU Executes Work
 
@@ -53,7 +53,7 @@ The NVIDIA H100 (Hopper architecture) has a memory hierarchy designed for massiv
 | L1 / Shared Memory | 256 KB per SM | ~33 TB/s (aggregate) | ~30 cycles |
 | Registers | 256 KB per SM | Instant | 1 cycle |
 
-Vector addition is **memory-bound** — the computation (one add per element) is trivial. The GPU spends almost all its time waiting for data from HBM3. Our job is to maximize memory bandwidth utilization.
+Vector addition is **memory-bound** — the computation (one add per element) is trivial. The GPU spends most of its time moving data to and from HBM3. Our job is to maximize memory bandwidth utilization.
 
 **What does "memory-bound" mean?** Every kernel is bottlenecked by either computation (math instructions) or memory (loading/storing data). Vector addition does 1 add per 12 bytes transferred (read A, read B, write C — each 4 bytes for float32). The GPU can do far more math than this in the time it takes to fetch the data, so the memory bus is the bottleneck. Optimizing a memory-bound kernel means getting data in and out of HBM as fast as possible.
 
@@ -88,7 +88,7 @@ The `solve` function is the **host-side** launcher — it runs on the CPU. The `
 
 ### Why This Is Slow
 
-The naive kernel typically achieves only 30–40% of peak HBM3 bandwidth on H100. The problem is **instruction overhead**: each thread issues one 4-byte load instruction per element. The memory controller coalesces warp-level accesses, but the instruction scheduler is overwhelmed by the sheer number of individual load/store instructions.
+The naive kernel often achieves only a fraction of peak HBM3 bandwidth on H100-class GPUs. One important limiter is **instruction overhead**: each thread issues scalar load/store instructions for a single element. The memory controller coalesces warp-level accesses, but the scheduler still has to process many individual memory instructions.
 
 To understand why, consider what each thread does: it issues 2 load instructions (one for `A[idx]`, one for `B[idx]`), 1 add, and 1 store. That's 3 memory instructions per element, each moving only 4 bytes. The GPU's instruction pipeline has limited throughput — it can only dispatch so many instructions per cycle. When every instruction moves so little data, the pipeline becomes the bottleneck, not the memory bus itself.
 
@@ -98,7 +98,7 @@ To understand why, consider what each thread does: it issues 2 load instructions
 
 The GPU memory bus is wide — each memory transaction fetches 128 bytes (a full cache line). In the naive kernel, each thread requests only 4 bytes, but the hardware still fetches the full 128-byte cache line. The data isn't wasted (neighboring threads use adjacent parts of the same cache line), but each thread pays the cost of issuing a separate instruction for just 4 bytes.
 
-**Vectorization** means loading more data per instruction. Instead of each thread loading one 4-byte float, each thread can load **4 floats (16 bytes) in a single 128-bit instruction**:
+**Vectorization** means loading more data per instruction. Instead of each thread loading one 4-byte float, each thread can load **4 floats (16 bytes) in a single 128-bit instruction**, as long as the pointer is 16-byte aligned:
 
 ```
 Naive:      Thread 0 loads A[0]     → 4 bytes,  1 instruction
@@ -147,15 +147,16 @@ void solve(const float* A, const float* B, float* C, int N) {
     int threads_per_block = 256;
     int vec_N = N / 4;
     int blocks = (vec_N + threads_per_block - 1) / threads_per_block;
+    blocks = blocks > 0 ? blocks : 1;  // still launch one block for N < 4 tail elements
     vectorized_add_kernel<<<blocks, threads_per_block>>>(A, B, C, N);
 }
 ```
 
 ### How `float4` Enables Vectorization
 
-`float4` is a CUDA built-in type — a struct with four members (`x`, `y`, `z`, `w`), each a 32-bit float, 16 bytes total. It's naturally aligned to 16 bytes in memory. When you load a `float4`, the compiler emits a single `LDG.E.128` instruction that fetches all 16 bytes in one shot — the same work that would take 4 separate instructions with scalar `float` loads.
+`float4` is a CUDA built-in type — a struct with four members (`x`, `y`, `z`, `w`), each a 32-bit float, 16 bytes total. The type has 16-byte alignment, and pointers returned by `cudaMalloc` are aligned enough for this use case. If you pass an offset pointer such as `A + 1`, the `reinterpret_cast<float4*>` version is no longer safe because the address is not 16-byte aligned. When alignment is valid, the compiler can emit a single 128-bit load/store instruction that moves all 16 bytes in one shot — the same data movement that would take 4 scalar float loads/stores.
 
-The `reinterpret_cast<const float4*>(A)` tells the compiler to treat the float array as an array of `float4`. This doesn't copy or rearrange any data — it just changes how the pointer arithmetic works. `A4[idx]` now accesses 4 contiguous floats starting at `A[idx * 4]`, and the compiler knows it can use a 128-bit load.
+The `reinterpret_cast<const float4*>(A)` tells the compiler to treat the float array as an array of `float4`. This doesn't copy or rearrange any data — it just changes how the pointer arithmetic works. `A4[idx]` now accesses 4 contiguous floats starting at `A[idx * 4]`. The cast is correct only when the base pointer is 16-byte aligned and the vectorized region contains complete groups of 4 floats.
 
 ### What Is Memory Coalescing?
 
@@ -207,7 +208,10 @@ __global__ void gridstride_add_kernel(const float* A, const float* B, float* C, 
 
 void solve(const float* A, const float* B, float* C, int N) {
     int threads_per_block = 256;
-    int blocks = min((N / 4 + threads_per_block - 1) / threads_per_block, 256);
+    int vec_N = N / 4;
+    int blocks = (vec_N + threads_per_block - 1) / threads_per_block;
+    blocks = blocks < 256 ? blocks : 256;
+    blocks = blocks > 0 ? blocks : 1;  // required when N < 4
     gridstride_add_kernel<<<blocks, threads_per_block>>>(A, B, C, N);
 }
 ```
@@ -229,23 +233,23 @@ Thread 65535: processes elements 65535, 131071, ...
 Benefits:
 
 - **Fixed grid size**: the number of blocks doesn't scale with N — you choose the grid size for optimal occupancy
-- **Better cache behavior**: threads in a block stay close together in address space across iterations, improving L2 hit rate
+- **Preserved coalescing**: neighboring threads still access neighboring addresses in every loop iteration
 - **Works for any N**: no need for a 1:1 thread-to-element mapping
 
 ### Capping Blocks at 256
 
-The H100 has 132 SMs, each running up to ~16 blocks (depending on register/shared memory pressure). With 256 threads/block, 256 blocks is enough to fully occupy the GPU while keeping launch overhead minimal.
+An H100 SXM has 132 SMs. With 256 threads/block, a 256-block grid gives the scheduler enough work to cover the device for this simple streaming kernel while avoiding tens of thousands of tiny blocks. The exact best cap is workload- and occupancy-dependent, so treat 256 as a reasonable benchmark setting rather than a universal rule.
 
 ## Performance Expectations
 
-| Kernel | Bandwidth (H100, float32) | % of Peak (3.35 TB/s) |
+| Kernel | Typical bandwidth target (H100 SXM, float32) | % of Peak (3.35 TB/s) |
 |--------|---------------------------|------------------------|
 | Naive (scalar loads) | ~1.0–1.3 TB/s | ~30–40% |
 | Vectorized (float4) | ~2.8–3.1 TB/s | ~85–93% |
 | Grid-stride + float4 | ~2.9–3.2 TB/s | ~87–95% |
 | Theoretical peak | 3.35 TB/s | 100% |
 
-The remaining gap comes from kernel launch overhead, TLB misses on large tensors, and L2 bank conflicts.
+The remaining gap depends on measurement details such as tensor size, launch overhead, compiler output, clocking, alignment, and memory-system effects. Always verify with a profiler or benchmark on the target GPU.
 
 ## Summary
 
@@ -253,7 +257,7 @@ The remaining gap comes from kernel launch overhead, TLB misses on large tensors
 |-----------|-------------|--------------|
 | `float4` loads/stores | Each thread loads 4 floats (16 bytes) per instruction | 4x fewer instructions vs scalar |
 | `reinterpret_cast<float4*>` | Treats `float*` as `float4*` for 128-bit access | Required for compiler to emit `LDG.E.128` |
-| Grid-stride loop | Each thread processes multiple chunks | Fixed grid size, better cache behavior, works for any N |
+| Grid-stride loop | Each thread processes multiple chunks | Fixed grid size while preserving coalesced access |
 | Tail handling | Scalar loop for `N % 4` remaining elements | Correctness for non-divisible N |
 | 256 threads/block | Good occupancy, multiple blocks per SM | Hides memory latency via warp switching |
 
@@ -261,7 +265,7 @@ The remaining gap comes from kernel launch overhead, TLB misses on large tensors
 
 # CuTe DSL Version
 
-The same vector addition problem can be expressed using NVIDIA's **CuTe DSL** — a Python-embedded domain-specific language from the [CUTLASS](https://github.com/NVIDIA/cutlass) library. CuTe provides higher-level abstractions (`zipped_divide`, TV layouts, `.load()`) that compile down to the same PTX instructions as the raw CUDA C++ above, but let you manipulate tensor layouts algebraically.
+The same vector addition problem can be expressed using NVIDIA's **CuTe DSL** — a Python-embedded domain-specific language from the [CUTLASS](https://github.com/NVIDIA/cutlass) library. CuTe provides higher-level abstractions (`zipped_divide`, TV layouts, `.load()`) that can generate the same kind of vectorized memory operations as the raw CUDA C++ above, but let you manipulate tensor layouts algebraically.
 
 **Why CuTe?** Raw CUDA gives you full control, but as kernels grow more complex (GEMM, attention, convolution), manually managing tile shapes, thread-to-data mappings, and memory access patterns becomes error-prone. CuTe lets you express these patterns declaratively — you describe the layout, and CuTe generates the indexing math for you.
 
@@ -317,7 +321,7 @@ def solve(A: cute.Tensor, B: cute.Tensor, C: cute.Tensor, N: cute.Uint32):
 
 ### Running It
 
-CuTe uses a two-step process: `cute.compile` JIT-compiles the kernel to GPU machine code (PTX → SASS), and then you call the compiled function. The `assumed_align=16` parameter is critical — it tells the compiler that the memory pointers are 16-byte aligned, which is required for the compiler to emit vectorized 128-bit load/store instructions later.
+CuTe uses a two-step process: `cute.compile` JIT-compiles the kernel to GPU machine code (PTX → SASS), and then you call the compiled function. The `assumed_align=16` parameter is critical — it tells the compiler that the memory pointers may be treated as 16-byte aligned. It does not realign memory for you; the input tensors must actually satisfy that alignment.
 
 ```python
 N = 25_000_000
@@ -348,7 +352,7 @@ torch.testing.assert_close(c, a + b)
 
 ## Part 2: Vectorized with `zipped_divide`
 
-In the CUDA C++ version, we used `float4` and `reinterpret_cast` to manually group 4 floats into a single 128-bit load. CuTe provides a higher-level abstraction for the same idea: `cute.zipped_divide(tensor, tiler)` partitions a tensor into fixed-size tiles. For vectorization, the tiler specifies how many contiguous elements each thread should access — 4 float32 elements = 16 bytes = one 128-bit load.
+In the CUDA C++ version, we used `float4` and `reinterpret_cast` to manually group 4 floats into a single 128-bit load. CuTe provides a higher-level abstraction for the same idea: `cute.zipped_divide(tensor, tiler)` partitions a tensor into fixed-size tiles. For vectorization, the tiler specifies how many contiguous elements each thread should access — 4 float32 elements = 16 bytes = one 128-bit load. The compact example below assumes `N` is divisible by 4; for arbitrary `N`, add a scalar cleanup path for the last `N % 4` elements.
 
 ### Key Insight: Vectorized Memory Access
 
@@ -385,7 +389,7 @@ def vectorized_add_kernel(
     # The 1st mode (4,) is the per-thread tile (4 contiguous float32 elements).
     # The 2nd mode (N/4,) indexes which tile each thread works on.
     if idx < vec_N:
-        # .load() emits a single 128-bit LDG.E.128 instruction
+        # With 16-byte alignment, .load() can compile to one 128-bit load
         a_vec = gA[(None, idx)].load()
         b_vec = gB[(None, idx)].load()
 
@@ -395,12 +399,13 @@ def vectorized_add_kernel(
 
 ### Host-Side: Tiling with `zipped_divide`
 
-The host function tiles each tensor before passing them to the kernel. `cute.zipped_divide(A, (4,))` reshapes an `(N,)` tensor into `((4,), (N/4,))` — grouping every 4 contiguous elements into a tile.
+The host function tiles each tensor before passing them to the kernel. `cute.zipped_divide(A, (4,))` reshapes an `(N,)` tensor into `((4,), (N/4,))` for the full vectorized portion — grouping every 4 contiguous elements into a tile.
 
 ```python
 @cute.jit
 def solve(A: cute.Tensor, B: cute.Tensor, C: cute.Tensor, N: cute.Uint32):
     threads_per_block = 256
+    # Compact example: N must be divisible by 4, or use a scalar tail kernel.
 
     # Tile: each thread handles 4 contiguous float32 = 16 bytes = 128-bit
     gA = cute.zipped_divide(A, (4,))
@@ -451,11 +456,11 @@ After zipped_divide(mA, (4,)):
 When thread `t` accesses `gA[(None, idx)].load()`:
 - `idx` selects which tile
 - `None` means "give me the entire tile" — all 4 elements
-- `.load()` compiles to a single `LDG.E.128` instruction because the 4 float32 values are contiguous and 16-byte aligned
+- `.load()` can compile to a single 128-bit load because the 4 float32 values are contiguous and 16-byte aligned
 
 ## Part 3: Advanced — TV Layout
 
-For production kernels, CuTe offers **TV (Thread-Value) Layout** — a rank-2 layout that maps `(thread_index, value_index)` directly to tensor coordinates. This decouples the thread-to-data mapping from the kernel logic, making it easy to experiment with different access patterns.
+For production kernels, CuTe offers **TV (Thread-Value) Layout** — a rank-2 layout that maps `(thread_index, value_index)` directly to tensor coordinates. This decouples the thread-to-data mapping from the kernel logic, making it easy to experiment with different access patterns. As written, this example also assumes the tensor length is divisible by the TV tile size; a fully general kernel needs a scalar or predicated boundary path for partial tiles.
 
 In the previous approaches, the kernel itself computed which data each thread should access (the index math). With TV layout, that mapping is defined **outside the kernel** as a layout object and passed in. The kernel simply says "give me my data" — it doesn't need to know how the data was partitioned.
 
@@ -516,6 +521,7 @@ def solve(A: cute.Tensor, B: cute.Tensor, C: cute.Tensor, N: cute.Uint32):
     val_layout = cute.make_ordered_layout((coalesced_ldst_bytes,), order=(0,))
     val_layout = cute.recast_layout(dtype.width, 8, val_layout)
     tiler_n, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
+    # Compact example: N must be divisible by cute.size(tiler_n), or use a tail path.
 
     gA = cute.zipped_divide(A, tiler_n)
     gB = cute.zipped_divide(B, tiler_n)
@@ -545,8 +551,8 @@ The TV layout separates **what each thread does** from **how data is arranged in
 | Technique | What It Does | Why It Helps |
 |-----------|-------------|--------------|
 | `zipped_divide(tensor, (4,))` | Tiles tensor so each thread gets 4 float32 elements | Enables 128-bit vectorized load/store |
-| `.load()` on tiled slice | Emits single `LDG.E.128` instruction | 4x fewer instructions vs scalar |
-| `from_dlpack(t, assumed_align=16)` | Guarantees 16-byte pointer alignment | Required for compiler to emit vectorized instructions |
+| `.load()` on tiled slice | Can emit a single 128-bit load | 4x fewer instructions vs scalar when aligned |
+| `from_dlpack(t, assumed_align=16)` | Tells CuTe the pointer is 16-byte aligned | Required for compiler to emit vectorized instructions; the tensor must actually be aligned |
 | `cute.composition(tensor, tv_layout)` | Maps (thread, value) → physical address | Decouples access pattern from kernel logic |
 
 ## What's Next
