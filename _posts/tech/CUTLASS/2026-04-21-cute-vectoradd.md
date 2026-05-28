@@ -352,7 +352,7 @@ torch.testing.assert_close(c, a + b)
 
 ## Part 2: Vectorized with `zipped_divide`
 
-In the CUDA C++ version, we used `float4` and `reinterpret_cast` to manually group 4 floats into a single 128-bit load. CuTe provides a higher-level abstraction for the same idea: `cute.zipped_divide(tensor, tiler)` partitions a tensor into fixed-size tiles. For vectorization, the tiler specifies how many contiguous elements each thread should access — 4 float32 elements = 16 bytes = one 128-bit load. The compact example below assumes `N` is divisible by 4; for arbitrary `N`, add a scalar cleanup path for the last `N % 4` elements.
+In the CUDA C++ version, we used `float4` and `reinterpret_cast` to manually group 4 floats into a single 128-bit load. CuTe provides a higher-level abstraction for the same idea: `cute.zipped_divide(tensor, tiler)` partitions a tensor into fixed-size tiles. For vectorization, the tiler specifies how many contiguous elements each thread should access — 4 float32 elements = 16 bytes = one 128-bit load. The example below keeps that vectorized path and adds a scalar cleanup kernel for the last `N % 4` elements.
 
 ### Key Insight: Vectorized Memory Access
 
@@ -385,9 +385,9 @@ def vectorized_add_kernel(
     idx = bidx * bdim + tidx
 
     # gA has been tiled by (4,) on the host side via zipped_divide.
-    # gA.shape is now ((4,), (N/4,)).
+    # Complete vector tiles are indexed by 0 ... floor(N/4)-1.
     # The 1st mode (4,) is the per-thread tile (4 contiguous float32 elements).
-    # The 2nd mode (N/4,) indexes which tile each thread works on.
+    # The 2nd mode indexes which complete tile each thread works on.
     if idx < vec_N:
         # With 16-byte alignment, .load() can compile to one 128-bit load
         a_vec = gA[(None, idx)].load()
@@ -395,17 +395,31 @@ def vectorized_add_kernel(
 
         # Elementwise add on the vector, then store (128-bit STG.E.128)
         gC[(None, idx)] = a_vec + b_vec
+
+
+@cute.kernel
+def scalar_tail_kernel(
+    gA: cute.Tensor,
+    gB: cute.Tensor,
+    gC: cute.Tensor,
+    start: cute.Uint32,
+    N: cute.Uint32,
+):
+    tidx, _, _ = cute.arch.thread_idx()
+    idx = start + tidx
+
+    if idx < N:
+        gC[idx] = gA[idx] + gB[idx]
 ```
 
 ### Host-Side: Tiling with `zipped_divide`
 
-The host function tiles each tensor before passing them to the kernel. `cute.zipped_divide(A, (4,))` reshapes an `(N,)` tensor into `((4,), (N/4,))` for the full vectorized portion — grouping every 4 contiguous elements into a tile.
+The host function tiles each tensor before passing them to the kernel. `cute.zipped_divide(A, (4,))` groups contiguous elements into 4-value tiles, and the vectorized kernel only consumes the first `N // 4` complete tiles. The grid is computed from `N`, not `vec_n`, so small cases like `N = 1` still launch one valid block instead of crashing with a zero-sized CUDA grid.
 
 ```python
 @cute.jit
 def solve(A: cute.Tensor, B: cute.Tensor, C: cute.Tensor, N: cute.Uint32):
     threads_per_block = 256
-    # Compact example: N must be divisible by 4, or use a scalar tail kernel.
 
     # Tile: each thread handles 4 contiguous float32 = 16 bytes = 128-bit
     gA = cute.zipped_divide(A, (4,))
@@ -413,8 +427,17 @@ def solve(A: cute.Tensor, B: cute.Tensor, C: cute.Tensor, N: cute.Uint32):
     gC = cute.zipped_divide(C, (4,))
 
     vec_n = N // 4
+    tail_start = vec_n * 4
+
+    # Use N for the block count so N < 4 still launches one valid block.
+    blocks = (N + threads_per_block * 4 - 1) // (threads_per_block * 4)
     vectorized_add_kernel(gA, gB, gC, vec_n).launch(
-        grid=((vec_n + threads_per_block - 1) // threads_per_block, 1, 1),
+        grid=(blocks, 1, 1),
+        block=(threads_per_block, 1, 1),
+    )
+
+    scalar_tail_kernel(A, B, C, tail_start, N).launch(
+        grid=(1, 1, 1),
         block=(threads_per_block, 1, 1),
     )
 ```
