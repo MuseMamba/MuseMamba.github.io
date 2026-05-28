@@ -474,16 +474,18 @@ When thread `t` accesses `gA[(None, idx)].load()`:
 
 ## Part 3: Advanced — TV Layout
 
-For production kernels, CuTe offers **TV (Thread-Value) Layout** — a rank-2 layout that maps `(thread_index, value_index)` directly to tensor coordinates. This decouples the thread-to-data mapping from the kernel logic, making it easy to experiment with different access patterns. As written, this example also assumes the tensor length is divisible by the TV tile size; a fully general kernel needs a scalar or predicated boundary path for partial tiles.
+For production kernels, CuTe offers **TV (Thread-Value) Layout** — a rank-2 layout that maps `(thread_index, value_index)` directly to tensor coordinates. This decouples the thread-to-data mapping from the kernel logic, making it easy to experiment with different access patterns. The version below also adds a coordinate tensor, so the final partial tile is handled by predicates inside the same kernel launch.
 
 In the previous approaches, the kernel itself computed which data each thread should access (the index math). With TV layout, that mapping is defined **outside the kernel** as a layout object and passed in. The kernel simply says "give me my data" — it doesn't need to know how the data was partitioned.
 
 ```python
 @cute.kernel
 def tv_add_kernel(
-    gA: cute.Tensor,
-    gB: cute.Tensor,
-    gC: cute.Tensor,
+    mA: cute.Tensor,
+    mB: cute.Tensor,
+    mC: cute.Tensor,
+    cC: cute.Tensor,
+    shape: cute.Shape,
     tv_layout: cute.Layout,
 ):
     tidx, _, _ = cute.arch.thread_idx()
@@ -491,9 +493,10 @@ def tv_add_kernel(
 
     # Slice to get this thread-block's tile
     blk_coord = (None, bidx)
-    blkA = gA[blk_coord]
-    blkB = gB[blk_coord]
-    blkC = gC[blk_coord]
+    blkA = mA[blk_coord]
+    blkB = mB[blk_coord]
+    blkC = mC[blk_coord]
+    blkCrd = cC[blk_coord]
 
     # Compose block-local tensor with TV layout:
     # blkA maps (TileN,) → physical address
@@ -502,19 +505,23 @@ def tv_add_kernel(
     tidfrgA = cute.composition(blkA, tv_layout)
     tidfrgB = cute.composition(blkB, tv_layout)
     tidfrgC = cute.composition(blkC, tv_layout)
+    tidfrgCrd = cute.composition(blkCrd, tv_layout)
 
     # Slice to get this thread's fragment
     thrA = tidfrgA[(tidx, None)]
     thrB = tidfrgB[(tidx, None)]
     thrC = tidfrgC[(tidx, None)]
+    thrCrd = tidfrgCrd[(tidx, None)]
 
-    # Vectorized load + add + store
-    thrC[None] = thrA.load() + thrB.load()
+    # Predicate each value so the final partial tile is safe.
+    for i in cutlass.range_constexpr(cute.size(thrCrd)):
+        if cute.elem_less(thrCrd[i], shape):
+            thrC[i] = thrA[i] + thrB[i]
 ```
 
 ### TV Layout Host Code
 
-The host constructs a TV layout that maps 256 threads to a tile, with each thread loading 16 contiguous bytes (4 float32 elements) per vectorized access.
+The host constructs a TV layout that maps 256 threads to a tile, with each thread owning 16 contiguous bytes (4 float32 elements). It also constructs an identity-coordinate tensor and tiles it with the same layout; the kernel uses those coordinates for bounds checks instead of launching a separate tail kernel.
 
 Breaking down the layout construction:
 - **Thread layout** `(256,)`: 256 threads in a 1D arrangement.
@@ -525,31 +532,40 @@ Breaking down the layout construction:
 @cute.jit
 def solve(A: cute.Tensor, B: cute.Tensor, C: cute.Tensor, N: cute.Uint32):
     coalesced_ldst_bytes = 16  # 128-bit = 16 bytes
+    threads_per_block = 256
 
     assert all(t.element_type == A.element_type for t in [A, B, C])
     dtype = A.element_type
 
     # Thread layout: 256 threads in 1D
-    thr_layout = cute.make_ordered_layout((256,), order=(0,))
+    thr_layout = cute.make_ordered_layout((threads_per_block,), order=(0,))
     # Value layout: each thread reads 16 bytes, recast to element type
     val_layout = cute.make_ordered_layout((coalesced_ldst_bytes,), order=(0,))
     val_layout = cute.recast_layout(dtype.width, 8, val_layout)
     tiler_n, tv_layout = cute.make_layout_tv(thr_layout, val_layout)
-    # Compact example: N must be divisible by cute.size(tiler_n), or use a tail path.
 
-    gA = cute.zipped_divide(A, tiler_n)
-    gB = cute.zipped_divide(B, tiler_n)
-    gC = cute.zipped_divide(C, tiler_n)
+    mA = cute.zipped_divide(A, tiler_n)
+    mB = cute.zipped_divide(B, tiler_n)
+    mC = cute.zipped_divide(C, tiler_n)
 
-    tv_add_kernel(gA, gB, gC, tv_layout).launch(
-        grid=[cute.size(gC, mode=[1]), 1, 1],
-        block=[cute.size(tv_layout, mode=[0]), 1, 1],
+    idC = cute.make_identity_tensor(C.shape)
+    cC = cute.zipped_divide(idC, tiler_n)
+
+    elems_per_thread = coalesced_ldst_bytes // 4  # float32
+    elems_per_block = elems_per_thread * threads_per_block
+    blocks = (N + elems_per_block - 1) // elems_per_block
+
+    tv_add_kernel(mA, mB, mC, cC, C.shape, tv_layout).launch(
+        grid=(blocks, 1, 1),
+        block=(threads_per_block, 1, 1),
     )
 ```
 
 ### Why TV Layout Matters
 
-The TV layout separates **what each thread does** from **how data is arranged in memory**. You can change the access pattern (e.g., different tile shapes, different thread-to-data mappings) by modifying only the layout construction — the kernel code stays the same. This is the foundation CuTe uses to build high-performance GEMM and attention kernels.
+The TV layout separates **what each thread does** from **how data is arranged in memory**. You can change the access pattern (e.g., different tile shapes, different thread-to-data mappings) by modifying only the layout construction — the kernel code stays the same. The coordinate tensor adds a clean boundary predicate, so the same kernel works for arbitrary `N`.
+
+The tradeoff is that value-by-value predicates may prevent the compiler from emitting the same clean 128-bit `.load()` / vector-store sequence shown in Part 2. In practice, this TV version is often the more robust CuTe pattern for arbitrary shapes, while the fused Part 2 version is the more direct route when the benchmark rewards explicit 128-bit vector loads.
 
 ### CuTe DSL Performance
 
@@ -557,7 +573,7 @@ The TV layout separates **what each thread does** from **how data is arranged in
 |--------|---------------------------|------------------------|
 | Naive (scalar loads) | ~1.0–1.3 TB/s | ~30–40% |
 | Vectorized (zipped_divide) | ~2.8–3.1 TB/s | ~85–93% |
-| TV Layout (production) | ~2.9–3.1 TB/s | ~87–93% |
+| TV Layout + predicates | workload-dependent | benchmark it |
 | Theoretical peak | 3.35 TB/s | 100% |
 
 ### CuTe DSL Summary
@@ -566,6 +582,7 @@ The TV layout separates **what each thread does** from **how data is arranged in
 |-----------|-------------|--------------|
 | `zipped_divide(tensor, (4,))` | Tiles tensor so each thread gets 4 float32 elements | Enables 128-bit vectorized load/store |
 | `.load()` on tiled slice | Can emit a single 128-bit load | 4x fewer instructions vs scalar when aligned |
+| Coordinate tensor + `cute.elem_less` | Predicates the final partial tile | Correctness for arbitrary `N` in one launch |
 | `from_dlpack(t, assumed_align=16)` | Tells CuTe the pointer is 16-byte aligned | Required for compiler to emit vectorized instructions; the tensor must actually be aligned |
 | `cute.composition(tensor, tv_layout)` | Maps (thread, value) → physical address | Decouples access pattern from kernel logic |
 
