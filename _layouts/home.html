@@ -1,0 +1,20 @@
+<!DOCTYPE html>
+<html lang="en">
+  {% include head.html %}
+  <body class="home-page">
+    <a class="skip-link" href="#main-content">Skip to content</a>
+    <header class="home-header home-width">
+      <a class="home-brand" href="{{ '/' | relative_url }}">Ren Zezhong<span aria-hidden="true">.</span></a>
+      <nav aria-label="Main navigation">
+        <a href="#about">About</a>
+        <a href="#work">Selected Work</a>
+        <a href="#publications">Publications</a>
+        <a href="#writing">Writing</a>
+      </nav>
+    </header>
+    <main id="main-content" class="home-width" tabindex="-1">
+      {{ content }}
+    </main>
+    {% include footer.html %}
+  </body>
+</html>

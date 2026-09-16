@@ -2,11 +2,12 @@
 title: "Ren Zezhong"
 email: renzezhong@outlook.com
 description: > # this means to ignore newlines until "baseurl:"
-  "Ren Zezhong | Researcher| Engineer"
+  Ren Zezhong (任泽众), PhD student at UCAS working on AI infrastructure,
+  LLM inference, agent runtime systems, and systems security.
 baseurl: "" # the subpath of your site, e.g. /blog/
 url: https://MuseMamba.github.io # the base hostname & protocol for your site
 rss_url: /pages/feed.xml
-author: RenZezhong
+author: Ren Zezhong
 
 # Sidebar filter
 # Choose 'tag' or 'category' as filter in sidebar.
@@ -43,8 +44,11 @@ sass:
 
 # Jekyll Plugin
 # https://help.github.com/articles/adding-jekyll-plugins-to-a-github-pages-site/
-gems:
+plugins:
   - jekyll-sitemap
   - jekyll-seo-tag
   - jekyll-feed
 
+exclude:
+  - docs
+  - README.md

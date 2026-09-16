@@ -1,0 +1,16 @@
+---
+layout: default
+title: Writing
+description: Technical notes on AI infrastructure, GPU programming, Linux, and research.
+---
+<article class="post container">
+  <h1 id="post-title">Writing</h1>
+  <p>Notes on systems, research, and learning. <a href="{{ '/' | relative_url }}">Back to homepage →</a></p>
+  {% for post in site.posts %}
+  <section>
+    <h2><a href="{{ post.url | relative_url }}">{{ post.title }}</a></h2>
+    <p><time datetime="{{ post.date | date_to_xmlschema }}">{{ post.date | date: '%B %d, %Y' }}</time>{% if post.subcategory %} · {{ post.subcategory }}{% endif %}</p>
+    {% if post.description %}<p>{{ post.description }}</p>{% endif %}
+  </section>
+  {% endfor %}
+</article>

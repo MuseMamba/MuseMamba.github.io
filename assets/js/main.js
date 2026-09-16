@@ -10,6 +10,12 @@ $(function() {
       posttoc = $('#post-toc-menu'),
       x1, y1;
 
+  // Show article content first when arriving from the homepage on small screens.
+  if ($(window).width() <= 1024) {
+    menu.add(sidebar).add(main).removeClass('open');
+    menu.attr('aria-expanded', 'false');
+  }
+
   // run this function after pjax load.
   var afterPjax = function() {
     // open links in new tab.
@@ -73,7 +79,7 @@ $(function() {
   NProgress.configure({ showSpinner: false });
 
   // Pjax
-  $(document).pjax('#sidebar-avatar, .toc-link', '#main', {
+  $(document).pjax('.toc-link', '#main', {
     fragment: '#main',
     timeout: 3000
   });
@@ -90,6 +96,7 @@ $(function() {
       // only remove open in small screen
       if($(window).width() <= 1024) {
         menu.add(sidebar).add(main).removeClass('open');
+        menu.attr('aria-expanded', 'false');
       }
     }
   });
@@ -127,11 +134,13 @@ $(function() {
   // Menu
   menu.on('click', function() {
     $(this).add(sidebar).add(menu).add(main).toggleClass('open');
+    menu.attr('aria-expanded', sidebar.hasClass('open') ? 'true' : 'false');
   });
 
   // right toc
   posttoc.on('click', function() {
     $('#post-toc').toggleClass('open');
+    posttoc.attr('aria-expanded', $('#post-toc').hasClass('open') ? 'true' : 'false');
   });
 
   // Search

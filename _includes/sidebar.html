@@ -1,7 +1,7 @@
 <aside id="sidebar" class="open">
   <div id="sidebar-left">
     <a id="sidebar-avatar" href="{{ "/" | prepend: site.baseurl }}">
-      {% if site.avatar != "" %}
+      {% if site.avatar and site.avatar != "" %}
         <img id="sidebar-avatar-img" alt="{{ site.title }}" src="{{ site.avatar | prepend: site.baseurl }}"/>
       {% else %}
         <span id="sidebar-home-text">Home</span>
@@ -9,8 +9,8 @@
     </a>
 
     <div id="sidebar-social">
-      <a href="{{ site.rss_url | prepend: site.baseurl }}" class="sidebar-social-icon feed"></a>
-      <a href="mailto:{{ site.email }}" class="sidebar-social-icon email"></a>
+      <a href="{{ site.rss_url | prepend: site.baseurl }}" class="sidebar-social-icon feed" aria-label="RSS feed"></a>
+      <a href="mailto:{{ site.email }}" class="sidebar-social-icon email" aria-label="Email Ren Zezhong"></a>
       {% include social.html %}
     </div>
 
@@ -48,7 +48,7 @@
 
   <div id="sidebar-right">
     <div id="search-box">
-      <input id="search-input" type="text" placeholder="Search" />
+      <input id="search-input" type="search" placeholder="Search" aria-label="Search blog posts" />
     </div>
 
     <nav id="toc">
