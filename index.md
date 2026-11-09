@@ -13,10 +13,8 @@ mathjax: false
     <p>I am a PhD student in Computer Science at the <strong>University of Chinese Academy of Sciences (UCAS)</strong>, where I began my doctoral studies in September 2022. From March 2024 to March 2025, I was a joint-training PhD student at <strong>EPFL</strong>, working with Mathias Payer.</p>
     <p>My work spans LLM inference runtimes, agent infrastructure, and systems security—from monitoring and isolating agent execution to exploring under-tested paths in the Linux kernel.</p>
   </div>
-  <div class="contact-links" aria-label="Contact and profiles">
-    <a class="primary-link" href="mailto:renzezhong@outlook.com">Get in touch <span aria-hidden="true">↗</span></a>
-    <a href="https://drive.google.com/file/d/1AwD917W4LgqnpLZicnX29fCE8BRyiGtY/view">CV (PDF, 中文)</a>
-    <a href="https://github.com/MuseMamba">GitHub</a>
+  <div class="contact-links" aria-label="Contact">
+    <a class="primary-link" href="mailto:{{ site.email }}">{{ site.email }}</a>
   </div>
   <p class="availability">Seeking AI infrastructure and agent systems opportunities for the 2027 graduate hiring cycle, including internships with a path to full-time roles.</p>
 </section>
